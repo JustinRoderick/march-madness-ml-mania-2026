@@ -211,3 +211,88 @@ _SCHEMAS: dict[str, dict[str, str]] = {
         "Pred": "float64",
     },
 }
+
+
+def _drop_ingest_artifacts(df: pd.DataFrame) -> pd.DataFrame:
+    if "_source_file" in df.columns:
+        df = df.drop(columns=["_source_file"])
+    return df
+
+
+def _apply_schema(df: pd.DataFrame, schema: dict[str, str]) -> pd.DataFrame:
+    present = {c: t for c, t in schema.items() if c in df.columns}
+    if not present:
+        return df
+    return df.astype(present, copy=False)
+
+
+def _strip_string_columns(df: pd.DataFrame) -> pd.DataFrame:
+    str_cols = df.select_dtypes(include="string").columns
+    for c in str_cols:
+        df[c] = df[c].str.strip()
+    return df
+
+
+def _parse_seasons_dayzero(df: pd.DataFrame) -> pd.DataFrame:
+    if "DayZero" not in df.columns:
+        return df
+    out = df.copy()
+    parsed = pd.to_datetime(out["DayZero"], format="%m/%d/%Y", errors="coerce")
+    out["DayZero"] = parsed.dt.normalize()
+    return out
+
+
+def clean_table(name: str, df: pd.DataFrame) -> pd.DataFrame:
+    df = _drop_ingest_artifacts(df)
+    if name in ("MSeasons", "WSeasons"):
+        df = _parse_seasons_dayzero(df)
+
+    df = df.drop_duplicates()
+    df = df.dropna()
+
+    schema = _SCHEMAS[name]
+    df = _apply_schema(df, schema)
+    df = _strip_string_columns(df)
+
+    return df
+
+
+def main(
+    bronze_dir: Path = DATA_DIR / "interim",
+    parquet_dir: Path = DATA_DIR / "processed",
+) -> dict[str, Any]:
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+
+    summary: dict[str, Any] = {"tables": {}}
+
+    for table in BRONZE_TABLES:
+        path = bronze_dir / f"{table}.parquet"
+        if not path.exists():
+            logger.warning("Skipping missing bronze table: {}", path)
+            continue
+
+        df = pd.read_parquet(path)
+        raw_len = len(df)
+        cleaned = clean_table(table, df)
+        out_path = parquet_dir / f"{table}.parquet"
+        cleaned.to_parquet(out_path, index=False)
+
+        summary["tables"][table] = {
+            "rows_in": raw_len,
+            "rows_out": len(cleaned),
+            "path": str(out_path),
+        }
+        logger.info(
+            "Cleaned {}: {:,} -> {:,} rows -> {}",
+            table,
+            raw_len,
+            len(cleaned),
+            out_path,
+        )
+
+    logger.success("Silver cleaning complete. Wrote {} tables to {}", len(summary["tables"]), parquet_dir)
+    return summary
+
+
+if __name__ == "__main__":
+    main()
